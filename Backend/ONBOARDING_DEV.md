@@ -104,11 +104,23 @@ BINDING_TIMESTAMP_WINDOW_SEC = 300
 APP_ID                    = "bliever-v1"
 BASE_CHAIN_ID             = process.env.NEXT_PUBLIC_BASE_CHAIN_ID ?? "84532"
 
+// Utility types
+type BaseChainId           = "8453" | "84532"  // prevents invalid chain IDs
+type HexString             = `0x${string}`
+type NostrPubkeyHex        // branded: raw 32-byte hex npub, not bech32
+type EvmAddressChecksummed // branded: EIP-55 checksummed address
+
+// Structural types
+type BindingTag            = ["d","identity-binding"] | ["binding",string] | ["evm",string]
+                             // use when building or reading binding event tags;
+                             // NostrBindingEvent.tags stays string[][] for nostr-tools compat
+
 // Core payload types
 interface BindIdentityPayload   // → /api/bind-identity and /api/onboarding
 interface VerifyIdentityPayload // → /api/verify-identity
 interface NostrBindingEvent     // Nostr event structure
 interface NostrBindingClaim     // JSON inside event.content
+                                // .version is typeof ONBOARDING_VERSION (not plain string)
 
 // Response types
 type BindingResponse           // BindingSuccessResponse | BindingErrorResponse
@@ -227,7 +239,12 @@ export const basePublicClient: PublicClient  // viem
 
 Singleton. Chain selected via `NEXT_PUBLIC_BASE_CHAIN_ID` env var:
 - `"8453"` → Base Mainnet (`viem/chains` `base`)
-- anything else → Base Sepolia (`viem/chains` `baseSepolia`)
+- `"84532"` → Base Sepolia (`viem/chains` `baseSepolia`)
+- any other value → **throws at module load** with a descriptive error message
+
+This fail-fast guard catches misconfigured deployment environments before any
+RPC call is attempted, surfacing the problem immediately rather than silently
+routing traffic to the wrong network.
 
 RPC URL priority:
 1. `BASE_RPC_URL` env var
@@ -594,9 +611,15 @@ mapping without the user explicitly calling the backend.
 ### `timestamp_expired` immediately after signing
 
 The client timestamp and server clock may differ. The 300-second window is
-generous; if you're seeing immediate expiry, check:
+generous for typical NTP-synced devices; if you're seeing immediate expiry:
+
 - Client is using `Math.floor(Date.now() / 1000)` (not milliseconds).
 - Server NTP sync is working.
+- **Mobile / manually-set clocks:** Devices where the user has disabled
+  automatic time synchronisation can be off by more than 5 minutes. The
+  recommended mitigation is to fetch the server's current unix timestamp
+  before generating the binding payload and use that value instead of the
+  local clock. A simple `GET /api/time → { now: number }` endpoint suffices.
 
 ### `invalid_nostr_signature`
 
@@ -612,3 +635,8 @@ Base Sepolia RPC may rate-limit. Set `BASE_RPC_URL` in `.env.local`:
 ```
 BASE_RPC_URL=https://base-sepolia.g.alchemy.com/v2/<YOUR_KEY>
 ```
+
+If `NEXT_PUBLIC_BASE_CHAIN_ID` is set to any value other than `"8453"` or
+`"84532"`, the server throws an error at startup (from `lib/evm/client.ts`)
+before serving any requests. This is intentional: a misconfigured chain ID
+would silently route ERC-1271 calls to the wrong network.
