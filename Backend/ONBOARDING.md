@@ -240,6 +240,7 @@ only the most recent binding.
 | **Relay spam / fake bindings** | Backend ignores events not backed by a valid ERC-1271 signature |
 | **CDP session compromise** | nsec encrypted with WebAuthn PRF, not derived from CDP session |
 | **Server-side key exposure** | Server never handles private keys; only public keys and signatures travel to backend |
+| **Device clock drift** | The 5-minute window tolerates typical NTP drift, but devices with manually-set clocks that are off by more than 5 minutes will fail onboarding. The client should fetch server time before generating the payload if clock accuracy cannot be assumed (common on mobile). |
 
 ### Key Security Properties
 
@@ -361,7 +362,19 @@ The message builder is isolated because it is a **shared contract** between
 the server (this codebase) and the client. Any developer changing this file
 must understand they are making a breaking change.
 
-### Decision: nostr-tools/pure (not nostr-tools)
+### Decision: Timestamp appears in three places (intentional redundancy)
+
+`timestamp` appears in the top-level payload, in `NostrBindingClaim` (inside
+`event.content`), and is reflected in the EVM consent message that the Smart
+Account signs. This is not an oversight — it is a tamper-detection mechanism.
+
+Each layer is cryptographically independent: the Schnorr signature covers the
+content (including `claim.timestamp`), and the ERC-1271 signature covers the
+consent message (including the `timestamp` parameter). An attacker who modifies
+the timestamp in one layer will break a signature in another. Collapsing these
+fields would remove that cross-layer guarantee.
+
+### Decision: `nostr-tools/pure` (not `nostr-tools`)
 
 The `/pure` sub-path export has no DOM dependencies, making it safe in Node.js
 and Edge runtimes. The main `nostr-tools` export pulls in browser-specific code.
@@ -372,7 +385,7 @@ and Edge runtimes. The main `nostr-tools` export pulls in browser-specific code.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `NEXT_PUBLIC_BASE_CHAIN_ID` | No | `84532` | `8453` for mainnet, `84532` for Sepolia |
+| `NEXT_PUBLIC_BASE_CHAIN_ID` | No | `84532` | `"8453"` for mainnet, `"84532"` for Sepolia. **Any other value causes a startup error** (validated in `lib/evm/client.ts`). |
 | `BASE_RPC_URL` | Recommended | Public endpoint | Private RPC URL for production |
 | `NEXT_PUBLIC_CDP_PROJECT_ID` | Yes (client) | — | CDP project identifier |
 | `NEXT_PUBLIC_CDP_APP_NAME` | Yes (client) | — | CDP application name |
