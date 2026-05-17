@@ -203,6 +203,7 @@ async function validateBindingPayload(
 | 1 | `checkTimestamp` | local | O(1) |
 | 2 | `checkNostrEventStructure` | local | O(tags) |
 | 3 | pubkey equality | local | O(1) |
+| 3.5 | `bindingId` UUID v4 format | local | O(1) |
 | 4 | `verifyNostrEvent` | CPU (secp256k1) | ~1ms |
 | 5 | `parseBindingClaim` | local | O(content) |
 | 6 | EVM address normalisation | local | O(1) |
@@ -246,9 +247,15 @@ This fail-fast guard catches misconfigured deployment environments before any
 RPC call is attempted, surfacing the problem immediately rather than silently
 routing traffic to the wrong network.
 
-RPC URL priority:
-1. `BASE_RPC_URL` env var
-2. `https://mainnet.base.org` or `https://sepolia.base.org`
+RPC transport priority (tried in order via viem's `fallback` transport):
+1. `BASE_RPC_URL` env var — primary Alchemy key
+2. `BASE_RPC_FALLBACK_URL` env var — secondary key or QuickNode
+3. Public Base endpoint (`mainnet.base.org` / `sepolia.base.org`) — rate-limited, last resort
+
+Each transport is configured with a 10 s timeout and 2 automatic retries
+(1 s delay) before viem advances to the next transport. A transport is only
+skipped on a network-level failure (timeout, connection refused); a valid RPC
+error response (e.g. an ERC-1271 revert) does **not** trigger failover.
 
 **Note:** The client is module-level. In Next.js serverless functions, each
 cold start creates a new client instance. This is fine — no persistent WebSocket
@@ -287,6 +294,12 @@ if (address is smart contract):
 
 CDP ERC-4337 Smart Accounts are contracts, so the on-chain path is always taken.
 This is why `BASE_RPC_URL` must be set to a reliable RPC in production.
+
+On any exception (network failure, timeout, RPC error), `verifyEVMSignature`
+logs a structured entry via `console.error` — including `expectedAddress` and
+the error message — before returning `false`. This makes infrastructure failures
+(Alchemy down, rate-limited) distinguishable from bad signatures in log
+aggregators, without changing the boolean return contract that callers depend on.
 
 ---
 
@@ -433,6 +446,15 @@ nostrEvent.pubkey === npub
 // fail → "nostr_pubkey_mismatch"
 ```
 
+**Step 3.5 — BindingId UUID format**
+```ts
+UUID_V4_REGEX.test(bindingId)
+// fail → "invalid_binding_id"
+```
+Rejects syntactically invalid UUIDs before the Schnorr CPU step and the ERC-1271
+RPC call. A malformed `bindingId` cannot match any claim content, so checking
+here avoids wasted work.
+
 **Step 4 — Schnorr signature (nostr-tools)**
 ```ts
 verifyEvent(nostrEvent)  // checks: id = sha256(serialised), sig valid for pubkey
@@ -444,7 +466,11 @@ verifyEvent(nostrEvent)  // checks: id = sha256(serialised), sig valid for pubke
 JSON.parse(nostrEvent.content)
 // fail → "invalid_content_json"
 // missing fields → "invalid_claim_fields"
+// raw.version !== ONBOARDING_VERSION → "invalid_claim_fields"
 ```
+The version field is compared against the `ONBOARDING_VERSION` constant, not
+merely type-checked as a string. A claim carrying `"2.0"` is rejected rather
+than silently accepted.
 
 **Step 6 — EVM address normalisation**
 ```ts
@@ -494,6 +520,7 @@ return { valid: true, normalizedEvmAddress, claim }
 | `missing_binding_tag` | 2 | No `binding` tag in event | Add `["binding", bindingId]` tag |
 | `missing_evm_tag` | 2 | No `evm` tag in event | Add `["evm", evmAddress]` tag |
 | `nostr_pubkey_mismatch` | 3 | `event.pubkey` ≠ `npub` | Use correct pubkey |
+| `invalid_binding_id` | 3.5 | `bindingId` is not a valid UUID v4 | Generate a fresh UUID v4 |
 | `invalid_nostr_signature` | 4 | Schnorr sig invalid or id mismatch | Re-sign event with correct nsec |
 | `invalid_content_json` | 5 | `event.content` not valid JSON | Fix content serialisation |
 | `invalid_claim_fields` | 5 | Missing field in claim object | Include all required claim fields |
@@ -605,8 +632,11 @@ mapping without the user explicitly calling the backend.
    Smart Account address. Ensure `evmAddress` is the Smart Account address,
    not the passkey/EOA owner address.
 
-3. **RPC issues** — If `BASE_RPC_URL` is unreachable, `verifyMessage` throws
-   and returns `false`. Check RPC connectivity.
+3. **RPC issues** — If `BASE_RPC_URL` is unreachable, the fallback transport
+   tries `BASE_RPC_FALLBACK_URL` then the public Base endpoint before
+   `verifyMessage` throws. If all three are unreachable the call returns `false`
+   and a structured error is logged via `console.error`. Check RPC connectivity
+   and ensure at least `BASE_RPC_URL` is set in production.
 
 ### `timestamp_expired` immediately after signing
 
@@ -631,10 +661,15 @@ generous for typical NTP-synced devices; if you're seeing immediate expiry:
 
 ### ERC-1271 call fails in development
 
-Base Sepolia RPC may rate-limit. Set `BASE_RPC_URL` in `.env.local`:
+Base Sepolia RPC may rate-limit. Set both RPC variables in `.env.local` for
+local resilience:
 ```
 BASE_RPC_URL=https://base-sepolia.g.alchemy.com/v2/<YOUR_KEY>
+BASE_RPC_FALLBACK_URL=https://base-sepolia.g.alchemy.com/v2/<BACKUP_KEY>
 ```
+The public Sepolia endpoint (`https://sepolia.base.org`) is always present as
+the final fallback even if neither variable is set, but it is rate-limited and
+unsuitable for repeated test runs.
 
 If `NEXT_PUBLIC_BASE_CHAIN_ID` is set to any value other than `"8453"` or
 `"84532"`, the server throws an error at startup (from `lib/evm/client.ts`)
