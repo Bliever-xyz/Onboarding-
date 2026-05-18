@@ -356,6 +356,12 @@ only and return `application/json`.
 { "success": false, "reason": "timestamp_expired" }
 ```
 
+**Rate limit response (429):**
+
+```jsonc
+{ "success": false, "reason": "rate_limited" }
+```
+
 ---
 
 ### 4.2 `POST /api/bind-identity`
@@ -365,6 +371,11 @@ only and return `application/json`.
 Identical request/response shape to `/api/onboarding`. The difference is
 semantic: this endpoint is used for re-linking (key rotation, wallet migration),
 not initial signup.
+
+Rate limiting is enforced per source IP: 10 requests per 60-second window.
+Exceeding the limit returns a 429 with `"rate_limited"`. The backing store is
+in-memory and scoped to a single process; replace it with a shared store (Redis,
+Upstash) before deploying multiple instances.
 
 **Success response (200):**
 
@@ -376,6 +387,12 @@ not initial signup.
   "evmAddress": "0xAbCd...",
   "verifiedAt": 1714567890
 }
+```
+
+**Rate limit response (429):**
+
+```jsonc
+{ "success": false, "reason": "rate_limited" }
 ```
 
 ---
@@ -528,6 +545,7 @@ return { valid: true, normalizedEvmAddress, claim }
 | `evm_address_mismatch` | 7 | Address in claim ≠ address in payload | Use same address in both |
 | `binding_id_mismatch` | 8 | `claim.bindingId` ≠ `bindingId` param | Use same UUID in both |
 | `invalid_evm_signature` | 9 | ERC-1271 call returned false | Re-sign consent message |
+| `rate_limited` | — | Source IP exceeded 10 req/min | Back off and retry after 60 s |
 | `internal_error` | — | Unhandled exception | Retry / report bug |
 
 ---
@@ -589,7 +607,8 @@ The indexer should:
 1. **Call** `POST /api/onboarding` or `POST /api/bind-identity` with the full payload.
 2. **On 200 response:** Store the binding in the database.
 3. **On 400 response:** Do not store. Log the `reason` for debugging.
-4. **On 500 response:** Retry with exponential backoff.
+4. **On 429 response:** Back off for at least 60 seconds before retrying. The `"rate_limited"` reason indicates the source IP has exceeded the per-minute request cap.
+5. **On 500 response:** Retry with exponential backoff.
 
 **Minimum schema to store (from success response):**
 
@@ -617,6 +636,23 @@ mapping without the user explicitly calling the backend.
 ---
 
 ## 9. Common Debugging Scenarios
+
+### `rate_limited` (429) during testing or indexer runs
+
+The in-memory limiter caps each source IP at 10 requests per 60-second window.
+During automated test runs or indexer bulk-imports, this limit can be hit
+quickly because all requests originate from the same IP.
+
+- **Local dev:** Slow requests down or increase `RL_MAX_REQUESTS` in `route.ts`
+  temporarily.
+- **Indexer in production:** The indexer's egress IP will hit the per-IP cap if
+  it replays many bindings in a short window. Spread requests with a delay, or
+  replace the in-memory store with Redis so the counter is shared and can be
+  keyed on something more granular (e.g. per-npub) rather than per-IP.
+- **Multi-instance deployments:** The in-memory store is not shared across
+  instances. Each instance maintains its own counter, so the effective limit
+  is `RL_MAX_REQUESTS × number_of_instances`. Replace with Redis before
+  scaling beyond a single process.
 
 ### `invalid_evm_signature` despite correct signing
 
