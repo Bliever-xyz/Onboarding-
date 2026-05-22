@@ -58,6 +58,12 @@ React hook, or signing library directly. It receives signing as a function param
 (`SignMessageFn`). This means the module can be called from any framework, tested with
 a mock signer, and upgraded to a new CDP SDK version without changing a single line here.
 
+**Client-only execution.** `flow.ts`, `nsec-storage.ts`, and `relay.ts` rely on
+browser APIs (IndexedDB, Web Crypto, WebAuthn, WebSocket) and carry a `"use client"`
+directive. In Next.js, this prevents the server bundler from touching them. In other
+environments, always import these modules inside browser-only code paths — never in
+a module that executes on the server.
+
 ---
 
 ## 3. Identity Model — Two Layers, One Link
@@ -411,8 +417,16 @@ browser crashes mid-flow, the Nostr key is already safe in storage. The user
 can be guided to retry the signature steps without losing their identity.
 
 **Trade-off:** A user who completes step 2 (IDB write) but abandons the flow
-will have an orphaned nsec in storage. The `hasStoredNsec()` helper allows the
-application to detect this state and route the user to a recovery or retry flow.
+will have an orphaned nsec in storage. `hasStoredNsec()` lets the application
+detect this state. Two recovery paths are available:
+
+- **Resume:** call `recoverNsec(handle)` to retrieve the existing nsec, then
+  pass it to `runBindIdentity` to complete the signing steps with the same
+  Nostr identity — preserving the user's npub.
+- **Reset:** call `clearStoredNsec()` before calling `runOnboarding` again to
+  generate a fresh identity from scratch.
+
+The application decides which path to offer based on product requirements.
 
 ### Decision: signMessage is Injected, Not Imported
 
@@ -424,19 +438,23 @@ A React consumer passes `useSignMessage()` from `@coinbase/cdp-hooks`. A test
 passes a mock that returns a fixed hex string. Neither change requires modifying
 `flow.ts`.
 
-### Decision: Relay Publication is Best-Effort
+### Decision: Relay Publication is Best-Effort with Per-Relay Retry
 
 After the server confirms the binding, `publishEventToRelays` is called but its
-result does not gate `OnboardingResult`. A partial relay failure or zero relay
-success logs a warning but does not throw.
+result does not gate `OnboardingResult`. Each relay is retried up to 2 times with
+linear backoff before being marked failed. A zero-success result logs a warning
+but does not throw.
 
 **Why:** The source of truth for the binding is the server's confirmation (and
 the indexer's storage of the response). Relays are the discovery layer; their
-availability should not be a hard dependency of onboarding.
+availability should not be a hard dependency of onboarding. The retry layer absorbs
+transient failures — common on mobile connections — without exposing retry complexity
+to the consumer.
 
-**Trade-off:** A user whose event reaches zero relays will be undiscoverable via
-relay queries until re-publication is attempted. The `nostrEvent` field in
-`OnboardingResult` enables the consumer to re-publish at any time.
+**Trade-off:** A user whose event reaches zero relays after all retries will be
+undiscoverable via relay queries until re-publication is attempted. The `nostrEvent`
+field in `OnboardingResult` enables the consumer to re-publish at any time using
+`publishEventToRelays(result.nostrEvent, relayUrls)`.
 
 ### Decision: bindingId Validated Before Signing
 
